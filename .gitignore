@@ -1,0 +1,11 @@
+# Python caches
+__pycache__/
+*.pyc
+
+# WSL-local RAG store (generated, not source)
+docbot_rag_store/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp

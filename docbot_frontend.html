@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DocBot — talk to your docs</title>
+<style>
+  :root { --ink:#1a1a1a; --paper:#f4ecd8; --accent:#2a6b2a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; background:var(--paper); color:var(--ink); height:100vh; display:flex; flex-direction:column; }
+  header { padding:14px 18px; border-bottom:2px solid var(--ink); display:flex; align-items:center; gap:10px; }
+  header h1 { font-size:20px; margin:0; letter-spacing:1px; }
+  header .dot { width:10px; height:10px; border-radius:50%; background:#3ad13a; }
+  #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .msg { max-width:78%; padding:10px 14px; border-radius:14px; line-height:1.45; white-space:pre-wrap; }
+  .user { align-self:flex-end; background:var(--accent); color:#fff; border-bottom-right-radius:4px; }
+  .bot  { align-self:flex-start; background:#fffdf5; border:1.5px solid var(--ink); border-bottom-left-radius:4px; }
+  .src  { font-size:11px; opacity:.6; margin-top:6px; }
+  .controls { display:flex; gap:8px; padding:12px 16px; border-top:2px solid var(--ink); align-items:center; }
+  #q { flex:1; padding:12px 14px; border:2px solid var(--ink); border-radius:24px; font-size:16px; outline:none; }
+  button { border:2px solid var(--ink); background:#fffdf5; border-radius:24px; padding:10px 16px; font-size:15px; cursor:pointer; }
+  button:active { transform:translateY(1px); }
+  #mic.rec { background:#e2533a; color:#fff; }
+  #mic.listening { background:#2a6b2a; color:#fff; animation:pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+  #speak { width:48px; display:flex; align-items:center; justify-content:center; }
+  #speak.playing { background:var(--accent); color:#fff; }
+  .hint { font-size:12px; opacity:.55; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="status"></span>
+  <h1>DOCBOT</h1>
+  <span class="hint">RAG over your vault · local LLM + Piper TTS</span>
+</header>
+
+<div id="log"></div>
+
+<div class="controls">
+  <input id="q" placeholder="Ask about a doc, error, or how-to…" autocomplete="off" />
+  <button id="mic" title="Speak">🎤</button>
+  <button id="send">Send</button>
+  <button id="speak" title="Play / pause audio" aria-label="Play or pause audio">▶️</button>
+</div>
+
+<script>
+const log = document.getElementById("log");
+const q = document.getElementById("q");
+const mic = document.getElementById("mic");
+const speak = document.getElementById("speak");
+let lastAnswer = "", history = [];
+
+// One persistent Audio object so play/pause acts on the same stream.
+const audio = new Audio();
+let audioUrl = null;        // object URL for the current clip
+let audioReady = false;     // a clip is loaded and not yet ended/revoked
+let pendingAfter = null;    // function to run when the current clip finishes
+
+// session state
+let userStarted = false;    // has the user sent/asked anything yet?
+let introPlayed = false;    // welcome has been scheduled
+let listening = false;      // bot is in "is there anything else?" listen mode
+let recActive = false;      // SpeechRecognition is running
+let listenTimer = null;     // 5s auto-disable timer
+
+// ---- TTS + sequenced playback ----
+function setSpeakIcon(playing) {
+  speak.textContent = playing ? "⏸️" : "▶️";
+  speak.classList.toggle("playing", playing);
+}
+
+async function loadAudio(text) {
+  if (!text || !text.trim()) return false;
+  const r = await fetch("/api/tts", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ text })
+  });
+  if (!r.ok) return false;
+  const blob = await r.blob();
+  if (audioUrl) URL.revokeObjectURL(audioUrl);
+  audioUrl = URL.createObjectURL(blob);
+  audio.src = audioUrl;
+  audioReady = true;
+  return true;
+}
+
+// Browsers block autoplay audio without a user gesture. If play() is rejected,
+// attach a one-time unlock on the next click/key so the welcome still plays.
+function playAudio() {
+  if (!audioReady) return;
+  audio.play().catch(() => {
+    if (window.__audioUnlocked) return;
+    const unlock = () => {
+      window.__audioUnlocked = true;
+      document.removeEventListener("pointerdown", unlock);
+      document.removeEventListener("keydown", unlock);
+      if (audioReady) audio.play().catch(() => {});
+    };
+    document.addEventListener("pointerdown", unlock, { once:true });
+    document.addEventListener("keydown", unlock, { once:true });
+  });
+}
+
+// Speak `text`, and run `after()` when it finishes (used to chain
+// answer -> "is there anything else?" -> listen).
+function playText(text, after) {
+  pendingAfter = after || null;
+  loadAudio(text).then(ok => { if (ok) playAudio(); else if (after) after(); });
+}
+
+audio.onplay  = () => setSpeakIcon(true);
+audio.onpause = () => { if (!audio.ended) setSpeakIcon(false); };
+audio.onended = () => {
+  audioReady = false;
+  setSpeakIcon(false);
+  if (audioUrl) { URL.revokeObjectURL(audioUrl); audioUrl = null; }
+  const fn = pendingAfter; pendingAfter = null;
+  if (fn) fn();
+};
+
+// speaker button: play/pause current clip, or replay last answer if ended
+speak.onclick = () => {
+  if (!audioReady && lastAnswer) { loadAudio(lastAnswer).then(ok => ok && playAudio()); return; }
+  if (audio.paused) playAudio(); else audio.pause();
+};
+
+// ---- chat ----
+function addMsg(text, who, sources) {
+  const d = document.createElement("div");
+  d.className = "msg " + who;
+  d.textContent = text;
+  if (sources && sources.length) {
+    const s = document.createElement("div");
+    s.className = "src";
+    s.textContent = "📚 " + sources.join(" · ");
+    d.appendChild(s);
+  }
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+// Detect a session-ending utterance ("that will be all", "I'm done", etc.).
+// Reply with a fixed farewell and DON'T ping the LLM or start the listen loop.
+const END_PATTERNS = [
+  /that('?s| will be| is)?\s*all\b/i,
+  /\bim\s+(done|finished|good|all set)\b/i,
+  /i'?m\s+(done|finished|good|all set)\b/i,
+  /\b(no|nothing|not)\s+(else|more|thanks|thank you)\b/i,
+  /^\s*(end|close|stop|exit|quit)(\s+(it|this|session|the session|chat))?\s*[.!]?$/i,
+  /\b(goodbye|bye|see you|that'?s it)\b/i,
+];
+function isSessionEnd(t) {
+  return END_PATTERNS.some(re => re.test(t));
+}
+
+async function ask(text) {
+  if (!text || !text.trim()) return;
+  userStarted = true;
+  pendingAfter = null;            // cancel any queued follow-up (e.g. user spoke first)
+  addMsg(text, "user");
+  q.value = "";
+
+  // Session-over: fixed farewell, no LLM, no listen loop.
+  if (isSessionEnd(text)) {
+    const farewell = "Anytime, here if you need me.";
+    lastAnswer = farewell;
+    addMsg(farewell, "bot");
+    history.push({user:text, bot:farewell});
+    playText(farewell);           // just speak it; nothing follows
+    return;
+  }
+
+  const resp = await fetch("/api/chat", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ query:text, history })
+  });
+  const data = await resp.json();
+  if (data.error) { addMsg(data.error, "bot"); return; }
+  lastAnswer = data.answer;
+  addMsg(data.answer, "bot", data.sources);
+  history.push({user:text, bot:data.answer});
+
+  // AUTO-PLAY the answer, then ask "Is there anything else?" and listen 5s.
+  playText(data.answer, () => {
+    playText("Is there anything else?", () => startListening(5000));
+  });
+}
+
+// ---- voice IN (Web Speech API) + listen-then-disable flow ----
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (SR) {
+  const rec = new SR();
+  rec.lang = "en-US"; rec.interimResults = false;
+
+  function startListening(ms = 5000) {
+    if (listening) return;
+    listening = true;
+    recActive = false;
+    mic.classList.add("listening");
+    mic.classList.remove("rec");
+    mic.title = ms >= 15000 ? "Listening… (click to stop)" : "Listening… 5s";
+    try { rec.start(); recActive = true; } catch (e) { /* already started */ }
+    clearTimeout(listenTimer);
+    listenTimer = setTimeout(() => stopListening(), ms);
+  }
+
+  function stopListening() {
+    clearTimeout(listenTimer);
+    if (!listening) return;
+    listening = false;
+    mic.classList.remove("listening", "rec");
+    mic.title = "Speak";
+    if (recActive) { try { rec.stop(); } catch (e) {} recActive = false; }
+  }
+
+  rec.onresult = e => {
+    const text = e.results[0][0].transcript;
+    stopListening();                       // stop mic as soon as we hear speech
+    pendingAfter = null;                   // don't re-trigger the follow-up chain
+    ask(text);
+  };
+  rec.onend = () => { recActive = false; if (listening) stopListening(); };
+  rec.onerror = () => { /* silence/no-speech -> onend follows and disables */ };
+
+  mic.onclick = () => {
+    if (listening || recActive) stopListening();
+    else startListening(15000);            // manual open-mic, longer window
+  };
+
+  // WELCOME: 5s after load, play intro, then open the mic for 5s to catch
+  // the user's first request (skipped if the user already started).
+  setTimeout(() => {
+    if (!userStarted && !introPlayed) {
+      introPlayed = true;
+      playText("Welcome, how can I help you today Dru", () => startListening(5000));
+    }
+  }, 5000);
+} else {
+  mic.disabled = true;
+  mic.title = "Speech recognition not supported in this browser";
+}
+
+// text send
+document.getElementById("send").onclick = () => ask(q.value);
+q.addEventListener("keydown", e => { if (e.key === "Enter") ask(q.value); });
+</script>
+</body>
+</html>
