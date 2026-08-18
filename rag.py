@@ -17,7 +17,7 @@ import urllib.request
 import numpy as np
 
 VAULT_PATH = os.getenv("VAULT_PATH",
-                        "/mnt/c/Users/mwint/hermes_space/Hermes_vault")
+                        "")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 STORE_DIR = os.path.expanduser("~/docbot_rag_store")  # WSL-local (avoids /mnt/c mount perm issues)
 INDEX = os.path.join(STORE_DIR, "index.npy")
